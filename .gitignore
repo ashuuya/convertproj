@@ -9,13 +9,39 @@ NORMALIZED/
 *.bin
 *.dll
 
-# Игнорируем системные файлы Python
+# Системные файлы Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Игнорируем настройки IDE
+# Настройки IDE
 .idea/
 .vscode/
+*.swp
+*.swo
 
-# Игнорируем личные ссылки (оставляем только шаблон)
+# Пользовательские данные (генерируются при первом запуске)
 links.txt
+config.json
+profiles_custom.json
+
+# Сборка PyInstaller
+build/
+dist/
+*.spec
+
+# Виртуальное окружение
+env/
+venv/
+.env/
+.venv/
+
+# Qwen
+.qwen/
+
+# Бинарники пользователя (ffmpeg, yt-dlp и т.д.)
+bin/
+
+# Файлы блокировки pip
+pip-selfcheck.json

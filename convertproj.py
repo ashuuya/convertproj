@@ -1,218 +1,317 @@
+"""
+convertproj.py — Библиотечный модуль для нормализации видео и конвертации под профиль телефона.
+Переработан для GUI: без print()/input(), весь прогресс через callback.
+"""
+
 import os
-import sys
 import subprocess
 import shutil
 import multiprocessing
-from tqdm import tqdm
 import json
+from pathlib import Path
+from typing import Optional, Callable
 
-# ==================================================================================================================================================================================================================================
-# НАСТРОЙКИ ПРОФИЛЕЙ
 
-PROFILES = {
-    "itel_it2163r": {
-        "description": "Профиль для Itel it2163R (160x128, 3GP/MPEG4)",
-        "output_extension": ".3gp",
-        "final_codec_video": "mpeg4",
-        "final_bitrate_video": "200k",
-        "final_resolution": "160x128",
-        "scaling_algorithm": "lanczos",
-        "final_codec_audio": "aac",
-        "final_bitrate_audio": "96k",
-        "final_samplerate_audio": 44100,
-        "final_channels_audio": 2,
-    },
-    "bq_3590": {
-        "description": "Профиль для BQ 3590 (480x320, 3GP/MPEG4)",
-        "output_extension": ".3gp",
-        "final_codec_video": "mpeg4",
-        "final_bitrate_video": "550k",
-        "final_resolution": "480x320",
-        "scaling_algorithm": "lanczos",
-        "final_codec_audio": "aac",
-        "final_bitrate_audio": "128k",
-        "final_samplerate_audio": 44100,
-        "final_channels_audio": 2,
-    },
-    "default": {
-        "description": "Профиль по умолчанию (Itel it2163R)",
-        "output_extension": ".3gp",
-        "final_codec_video": "mpeg4",
-        "final_bitrate_video": "200k",
-        "final_resolution": "160x128",
-        "scaling_algorithm": "lanczos",
-        "final_codec_audio": "aac",
-        "final_bitrate_audio": "96k",
-        "final_samplerate_audio": 44100,
-        "final_channels_audio": 2,
+# ============================================================================
+# ЗАВОДСКИЕ ПРОФИЛИ
+# ============================================================================
+
+def get_default_profiles() -> dict:
+    """Вернуть встроенные заводские профили. Копия для изменений."""
+    return {
+        "itel_it2163r": {
+            "description": "Профиль для Itel it2163R (160x128, 3GP/MPEG4)",
+            "output_extension": ".3gp",
+            "final_codec_video": "mpeg4",
+            "final_bitrate_video": "200k",
+            "final_resolution": "160x128",
+            "scaling_algorithm": "lanczos",
+            "final_codec_audio": "aac",
+            "final_bitrate_audio": "96k",
+            "final_samplerate_audio": 44100,
+            "final_channels_audio": 2,
+            "builtin": True,
+        },
+        "bq_3590": {
+            "description": "Профиль для BQ 3590 (480x320, 3GP/MPEG4)",
+            "output_extension": ".3gp",
+            "final_codec_video": "mpeg4",
+            "final_bitrate_video": "550k",
+            "final_resolution": "480x320",
+            "scaling_algorithm": "lanczos",
+            "final_codec_audio": "aac",
+            "final_bitrate_audio": "128k",
+            "final_samplerate_audio": 44100,
+            "final_channels_audio": 2,
+            "builtin": True,
+        },
     }
-}
 
-# --- ОБЩИЕ НАСТРОЙКИ ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-INPUT_FOLDER = os.path.join(BASE_DIR, "Downloads", "Recode")
-OUTPUT_FOLDER_BASE = os.path.join(BASE_DIR, "Downloads", "Recoded")
-CPU_CORES_TO_USE = 16 
 
-# --- настройки нормализации ---
-NORMALIZE_FPS = 30
+# ============================================================================
+# ПРОТОКОЛ CALLBACK
+# ============================================================================
 
-# аппаратный кодировщик: 'h264_nvenc' (для NVIDIA), 'h264_amf' (для AMD), 'h264_qsv' (для Intel Quick Sync), возврат на процессор: 'libx264'
-HARDWARE_ENCODER = 'h264_nvenc' 
-#===================================================================================================================================================================================================================================
+class ProgressCallback:
+    """Интерфейс callback для отчёта о прогрессе из рабочих потоков.
 
-NORMALIZED_FOLDER = os.path.join(os.path.dirname(OUTPUT_FOLDER_BASE), "NORMALIZED")
-
-def check_ffmpeg():
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"): print("ОШИБКА: FFmpeg или FFprobe не найдены в PATH!"); exit()
-    return "ffmpeg", "ffprobe"
-
-def get_video_files(folder):
-    supported_formats = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.webm'); files = []
-    for f in os.listdir(folder):
-        if f.lower().endswith(supported_formats): files.append(os.path.join(folder, f))
-    return files
-
-def is_vfr(file_path, ffprobe_executable):
-    command = [ffprobe_executable, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=pkt_duration_time', '-of', 'json', '-read_intervals', '%+2', file_path]
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout); durations = [float(frame.get('pkt_duration_time', 0)) for frame in data.get('frames', [])]
-        if not durations: return False
-        return len(set(round(d, 5) for d in durations)) > 1
-    except Exception: return True
-
-# ИЗМЕНЕНИЯ В ФУНКЦИИ НОРМАЛИЗАЦИИ
-def normalize_video(args):
+    Передаётся экземпляр, методы которого излучают Qt-сигналы из QThread.
     """
-    Этап 1: Нормализация видео с использованием аппаратного ускорения (GPU).
-    """
-    file_path, ffmpeg_executable, ffprobe_executable = args
-    filename = os.path.basename(file_path)
-    output_path = os.path.join(NORMALIZED_FOLDER, filename)
-    if os.path.exists(output_path): return output_path
+    def on_status(self, message: str) -> None: ...
+    def on_progress(self, percent: float, current_file: str, file_index: int, total_files: int) -> None: ...
+    def on_file_done(self, file_path: str) -> None: ...
+    def on_error(self, error: str) -> None: ...
+    def on_finished(self, output_files: list) -> None: ...
 
-    # Собираем команду
-    command = [
-        ffmpeg_executable, '-i', file_path,
-        '-c:v', HARDWARE_ENCODER, # Используем кодировщик из настроек
-        '-preset', 'fast',      # Пресет скорости для GPU
-        '-cq', '24',             # Режим качества для GPU (аналог CRF)
-        '-r', str(NORMALIZE_FPS),
-        '-vsync', 'cfr',
-        '-c:a', 'copy',          # Копируем аудио без перекодирования
-        '-y', output_path
+
+# ============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================================
+
+def get_ffmpeg_path(bin_dir: Optional[Path] = None) -> str:
+    """Вернуть путь к ffmpeg, предпочитая указанную bin_dir."""
+    if bin_dir:
+        candidate = str(bin_dir / "ffmpeg.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    raise FileNotFoundError("ffmpeg не найден. Убедитесь, что он установлен или лежит в bin/.")
+
+def get_ffprobe_path(bin_dir: Optional[Path] = None) -> str:
+    """Вернуть путь к ffprobe."""
+    if bin_dir:
+        candidate = str(bin_dir / "ffprobe.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    raise FileNotFoundError("ffprobe не найден.")
+
+SUPPORTED_FORMATS = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.webm')
+
+def is_vfr(file_path: str, ffprobe_executable: str) -> bool:
+    """Проверить, имеет ли видео переменный FPS (VFR) в первых ~2 секундах."""
+    cmd = [
+        ffprobe_executable, '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'frame=pkt_duration_time',
+        '-of', 'json',
+        '-read_intervals', '%+2',
+        file_path,
     ]
-    
-    # Если используется процессор, меняем параметры
-    if HARDWARE_ENCODER == 'libx264':
-        command = [
-            ffmpeg_executable, '-i', file_path,
-            '-c:v', 'libx264',
-            '-crf', '20',
-            '-preset', 'fast',
-            '-r', str(NORMALIZE_FPS),
-            '-vsync', 'cfr',
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        durations = [float(f.get('pkt_duration_time', 0)) for f in data.get('frames', [])]
+        if not durations:
+            return False
+        return len(set(round(d, 5) for d in durations)) > 1
+    except Exception:
+        return True  # Считаем VFR при ошибке для безопасности
+
+
+# ============================================================================
+# НОРМАЛИЗАЦИЯ (VFR → CFR)
+# ============================================================================
+
+def _normalize_one(args: tuple) -> Optional[str]:
+    """Нормализовать один файл (используется внутри multiprocessing pool)."""
+    file_path, ffmpeg_exe, output_dir, normalize_fps, hardware_encoder = args
+    filename = os.path.basename(file_path)
+    out_path = os.path.join(output_dir, filename)
+    if os.path.exists(out_path):
+        return out_path
+
+    if hardware_encoder == 'libx264':
+        cmd = [
+            ffmpeg_exe, '-i', file_path,
+            '-c:v', 'libx264', '-crf', '20', '-preset', 'fast',
+            '-r', str(normalize_fps), '-vsync', 'cfr',
             '-c:a', 'copy',
-            '-y', output_path
+            '-y', out_path,
+        ]
+    else:
+        cmd = [
+            ffmpeg_exe, '-i', file_path,
+            '-c:v', hardware_encoder, '-preset', 'fast', '-cq', '24',
+            '-r', str(normalize_fps), '-vsync', 'cfr',
+            '-c:a', 'copy',
+            '-y', out_path,
         ]
 
     try:
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return output_path
-    except subprocess.CalledProcessError as e:
-        print(f"\nОшибка при нормализации файла {filename}: {e}")
-        print("Возможная причина: убедитесь, что у вас установлены драйверы видеокарты и FFmpeg скомпилирован с поддержкой вашего кодировщика.")
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return out_path
+    except subprocess.CalledProcessError:
         return None
 
-def convert_for_phone(args):
-    file_path, ffmpeg_executable, ffprobe_executable, profile = args
-    filename = os.path.splitext(os.path.basename(file_path))[0] + profile['output_extension']
-    output_folder_profile = os.path.join(OUTPUT_FOLDER_BASE, profile_name)
-    os.makedirs(output_folder_profile, exist_ok=True)
-    output_path = os.path.join(output_folder_profile, filename)
-    if os.path.exists(output_path): return
-    try:
-        probe_command = [ffprobe_executable, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=r_frame_rate', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
-        result = subprocess.run(probe_command, capture_output=True, text=True, check=True)
-        target_fps_str = result.stdout.strip()
-        if not target_fps_str: raise ValueError("ffprobe не вернул значение FPS")
-    except Exception as e:
-        print(f"\nНе удалось определить FPS для {os.path.basename(file_path)}: {e}. Используется значение по умолчанию {NORMALIZE_FPS}.")
-        target_fps_str = str(NORMALIZE_FPS)
-    
-    video_filter = f"scale={profile['final_resolution']}:force_original_aspect_ratio=decrease:flags={profile['scaling_algorithm']},pad={profile['final_resolution']}:-1:-1:color=black"
-    
-    command = [ffmpeg_executable, '-i', file_path]
-    command.extend(['-c:v', profile['final_codec_video'], '-b:v', profile['final_bitrate_video'], '-r', target_fps_str])
-    if profile['final_codec_video'] == 'libx264':
-        if 'h264_profile' in profile: command.extend(['-profile:v', profile['h264_profile']])
-        if 'h264_level' in profile: command.extend(['-level:v', profile['h264_level']])
-    command.extend(['-vf', video_filter])
-    command.extend(['-c:a', profile['final_codec_audio'], '-b:a', profile['final_bitrate_audio'], '-ar', str(profile['final_samplerate_audio']), '-ac', str(profile['final_channels_audio'])])
-    command.extend(['-y', output_path])
-    
-    try:
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError as e:
-        print(f"\nОшибка при финальной конвертации файла {filename}: {e}")
 
-def main():
-    global profile_name
-    if len(sys.argv) > 1 and sys.argv[1] in PROFILES:
-        profile_name = sys.argv[1]
-    else:
-        profile_name = "default"
-    
-    selected_profile = PROFILES[profile_name]
-    
-    print(f"========================================================")
-    print(f"ЗАПУСК КОНВЕРТАЦИИ С ПРОФИЛЕМ: '{profile_name}'")
-    print(f"Описание: {selected_profile['description']}")
-    print(f"Ускорение нормализации: {HARDWARE_ENCODER}")
-    print(f"========================================================")
-    
-    ffmpeg_executable, ffprobe_executable = check_ffmpeg()
-    os.makedirs(INPUT_FOLDER, exist_ok=True)
-    
-    normalized_folder = os.path.join(os.path.dirname(OUTPUT_FOLDER_BASE), "NORMALIZED")
-    os.makedirs(normalized_folder, exist_ok=True)
-    
-    all_files = get_video_files(INPUT_FOLDER)
-    if not all_files: print(f"В папке '{INPUT_FOLDER}' не найдено видеофайлов."); return
+def normalize_videos(
+    file_paths: list,
+    ffmpeg_exe: str,
+    ffprobe_exe: str,
+    output_dir: str,
+    normalize_fps: int = 30,
+    hardware_encoder: str = 'h264_nvenc',
+    cpu_cores: int = 4,
+    callback: Optional[ProgressCallback] = None,
+) -> list:
+    """Проанализировать файлы на VFR, нормализовать нуждающиеся, вернуть все стабильные пути."""
+    os.makedirs(output_dir, exist_ok=True)
 
-    print(f"\nНайдено видеофайлов: {len(all_files)}. Анализ на VFR...")
-    files_to_normalize, files_to_convert_directly = [], []
-    for f in tqdm(all_files, desc="Анализ файлов"):
-        if is_vfr(f, ffprobe_executable): files_to_normalize.append(f)
-        else: files_to_convert_directly.append(f)
-    
-    print(f"\nТребуют нормализации (VFR): {len(files_to_normalize)} шт.")
-    print(f"Готовы к конвертации (CFR): {len(files_to_convert_directly)} шт.")
+    if callback:
+        callback.on_status("Анализ файлов на VFR…")
 
-    cores = multiprocessing.cpu_count() if CPU_CORES_TO_USE == 0 else min(CPU_CORES_TO_USE, multiprocessing.cpu_count())
-    source_for_final_conversion = [] + files_to_convert_directly
+    vfr_files = []
+    cfr_files = []
+    for i, fp in enumerate(file_paths):
+        if callback:
+            callback.on_progress(0, os.path.basename(fp), i + 1, len(file_paths))
+        if is_vfr(fp, ffprobe_exe):
+            vfr_files.append(fp)
+        else:
+            cfr_files.append(fp)
 
-    if files_to_normalize:
-        print(f"\n--- ЭТАП 1: Нормализация VFR видео ---")
-        tasks = [(f, ffmpeg_executable, ffprobe_executable) for f in files_to_normalize]
-        with multiprocessing.Pool(processes=cores) as pool:
-            normalized_files = list(tqdm(pool.imap_unordered(normalize_video, tasks), total=len(tasks), desc="Нормализация"))
-        source_for_final_conversion.extend([f for f in normalized_files if f is not None])
+    if not vfr_files:
+        if callback:
+            callback.on_status("VFR-файлов не найдено, нормализация не требуется.")
+        return cfr_files  # Все уже CFR
 
-    if not source_for_final_conversion: print("\nНет файлов для финальной конвертации."); return
+    if callback:
+        callback.on_status(f"Нормализация {len(vfr_files)} VFR-файлов…")
 
-    print("\n--- ЭТАП 2: Финальная конвертация для телефона ---")
-    tasks = [(f, ffmpeg_executable, ffprobe_executable, selected_profile) for f in source_for_final_conversion]
+    cores = min(cpu_cores, multiprocessing.cpu_count())
+    pool_args = [(f, ffmpeg_exe, output_dir, normalize_fps, hardware_encoder) for f in vfr_files]
+
     with multiprocessing.Pool(processes=cores) as pool:
-        list(tqdm(pool.imap_unordered(convert_for_phone, tasks), total=len(tasks), desc="Конвертация"))
-    
-    print("\nКонвертация завершена!")
-    if files_to_normalize:
-        try:
-            if input(f"Удалить временную папку '{normalized_folder}'? (y/n): ").lower() == 'y':
-                shutil.rmtree(normalized_folder); print("Временные файлы удалены.")
-        except Exception as e: print(f"Не удалось удалить временную папку: {e}")
+        results = list(pool.imap_unordered(_normalize_one, pool_args))
 
-if __name__ == '__main__':
-    main()
+    normalized = [r for r in results if r is not None]
+    failed = len(vfr_files) - len(normalized)
+
+    if failed and callback:
+        callback.on_error(f"{failed} файлов не удалось нормализовать.")
+
+    return cfr_files + normalized
+
+
+# ============================================================================
+# КОНВЕРТАЦИЯ ПОД ТЕЛЕФОН
+# ============================================================================
+
+def _convert_one(args: tuple) -> Optional[str]:
+    """Конвертировать один файл под профиль телефона (multiprocessing)."""
+    file_path, ffmpeg_exe, profile, output_dir = args
+    base = os.path.splitext(os.path.basename(file_path))[0]
+    out_name = base + profile['output_extension']
+    out_path = os.path.join(output_dir, out_name)
+    if os.path.exists(out_path):
+        return out_path
+
+    filter_str = (
+        f"scale={profile['final_resolution']}:force_original_aspect_ratio=decrease:"
+        f"flags={profile['scaling_algorithm']},"
+        f"pad={profile['final_resolution']}:-1:-1:color=black"
+    )
+
+    cmd = [
+        ffmpeg_exe, '-i', file_path,
+        '-c:v', profile['final_codec_video'],
+        '-b:v', profile['final_bitrate_video'],
+        '-vf', filter_str,
+        '-c:a', profile['final_codec_audio'],
+        '-b:a', profile['final_bitrate_audio'],
+        '-ar', str(profile['final_samplerate_audio']),
+        '-ac', str(profile['final_channels_audio']),
+        '-y', out_path,
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return out_path
+    except subprocess.CalledProcessError:
+        return None
+
+
+def convert_for_phone(
+    file_paths: list,
+    profile: dict,
+    ffmpeg_exe: str,
+    output_dir: str,
+    cpu_cores: int = 4,
+    callback: Optional[ProgressCallback] = None,
+) -> list:
+    """Пакетная конвертация файлов под профиль телефона."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    if callback:
+        callback.on_status(f"Конвертация {len(file_paths)} файлов…")
+
+    cores = min(cpu_cores, multiprocessing.cpu_count())
+    pool_args = [(f, ffmpeg_exe, profile, output_dir) for f in file_paths]
+
+    with multiprocessing.Pool(processes=cores) as pool:
+        results = list(pool.imap_unordered(_convert_one, pool_args))
+
+    output_files = [r for r in results if r is not None]
+    failed = len(file_paths) - len(output_files)
+
+    if failed and callback:
+        callback.on_error(f"{failed} файлов не удалось конвертировать.")
+    if callback:
+        callback.on_finished(output_files)
+
+    return output_files
+
+
+# ============================================================================
+# ВЫСОКОУРОВНЕВЫЙ ПАЙПЛАЙН
+# ============================================================================
+
+def batch_process(
+    file_paths: list,
+    profile: dict,
+    input_dir: str,
+    output_dir: str,
+    ffmpeg_exe: str,
+    ffprobe_exe: str,
+    normalize_fps: int = 30,
+    hardware_encoder: str = 'h264_nvenc',
+    cpu_cores: int = 4,
+    callback: Optional[ProgressCallback] = None,
+) -> list:
+    """Полный пайплайн: нормализация (если VFR) → конвертация под профиль телефона.
+
+    Файлы, уже имеющие CFR, пропускают нормализацию автоматически.
+    """
+    normalized_dir = os.path.join(os.path.dirname(output_dir), "NORMALIZED")
+
+    # Этап 1: Нормализация
+    if callback:
+        callback.on_status("Этап 1: Проверка и нормализация VFR…")
+    stable_files = normalize_videos(
+        file_paths, ffmpeg_exe, ffprobe_exe,
+        normalized_dir, normalize_fps, hardware_encoder,
+        cpu_cores, callback,
+    )
+
+    # Этап 2: Конвертация
+    if callback:
+        callback.on_status("Этап 2: Конвертация под профиль телефона…")
+    output = convert_for_phone(
+        stable_files, profile, ffmpeg_exe,
+        os.path.join(output_dir, profile.get('_profile_name', 'default')),
+        cpu_cores, callback,
+    )
+
+    # Очистка временной папки
+    if os.path.isdir(normalized_dir):
+        try:
+            shutil.rmtree(normalized_dir)
+        except OSError:
+            pass
+
+    return output

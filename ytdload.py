@@ -1,119 +1,216 @@
+"""
+ytdload.py — Библиотечный модуль для скачивания видео с YouTube через yt-dlp.
+Переработан для GUI: без print()/input(), весь прогресс через callback.
+Поддерживает многопоточную загрузку через ThreadPoolExecutor.
+"""
+
 import os
 import subprocess
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Optional
 
-# ================================================================
-# НАСТРОЙКИ
-# ================================================================
-# Папка, куда будут скачиваться видео
-DOWNLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Downloads", "Recode")
 
-# Имя файла, в котором будут храниться ссылки для скачивания
-LINKS_FILE = "links.txt"
+# ============================================================================
+# CALLBACK
+# ============================================================================
 
-# ================================================================
-# КОД ПРОГРАММЫ
-# ================================================================
+class DownloadCallback:
+    def on_status(self, message: str) -> None: ...
+    def on_progress(self, percent: float, current_file: str, file_index: int, total_files: int) -> None: ...
+    def on_file_done(self, file_path: str) -> None: ...
+    def on_error(self, error: str) -> None: ...
+    def on_finished(self, downloaded_files: list) -> None: ...
 
-def check_ytdlp():
-    """Проверяет, доступен ли yt-dlp."""
-    ytdlp_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yt-dlp.exe")
-    if not os.path.exists(ytdlp_path):
-        # Если локально нет, ищем в PATH
-        if not shutil.which("yt-dlp"):
-            print("ОШИБКА: yt-dlp.exe не найден!")
-            print("Пожалуйста, скачайте yt-dlp.exe и положите его в ту же папку, что и этот скрипт, или добавьте в PATH.")
-            input("Нажмите Enter, чтобы выйти...")
-            exit()
-        return "yt-dlp"
-    return ytdlp_path
 
-def get_quality_args():
-    """Спрашивает пользователя о качестве и возвращает аргументы формата."""
-    print("\n=== ВЫБОР КАЧЕСТВА ===")
-    print("1. 360p  (Низкое, экономия места)")
-    print("2. 720p  (HD, оптимально)")
-    print("3. 1080p (FullHD, стандарт)")
-    print("4. Максимально доступное (2K/4K)")
-    
-    choice = input("Введите номер (1-4) и нажмите Enter [по умолчанию 3]: ").strip()
-    
-    # Базовая часть строки формата: предпочитаем mp4 видео и m4a аудио
+# ============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================================
+
+def get_ytdlp_path(bin_dir: Optional[Path] = None) -> str:
+    """Вернуть путь к yt-dlp."""
+    if bin_dir:
+        candidate = str(bin_dir / "yt-dlp.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    found = shutil.which("yt-dlp")
+    if found:
+        return found
+    # Запасной вариант: рядом со скриптом
+    script_dir = Path(__file__).parent
+    local = script_dir / "yt-dlp.exe"
+    if local.is_file():
+        return str(local)
+    raise FileNotFoundError("yt-dlp.exe не найден. Положите его в папку bin/ или добавьте в PATH.")
+
+
+def parse_links(links_file: str) -> list:
+    """Прочитать ссылки из файла, пропуская комментарии и пустые строки."""
+    links = []
+    with open(links_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                links.append(line)
+    return links
+
+
+def build_format_string(quality: str) -> str:
+    """Собрать строку формата yt-dlp из названия пресета качества."""
     base_video = "bestvideo[ext=mp4]"
     base_audio = "bestaudio[ext=m4a]"
     fallback = "best[ext=mp4]/best"
 
-    if choice == "1":
-        print(">> Выбрано: 360p")
-        height_limit = "[height<=360]"
-    elif choice == "2":
-        print(">> Выбрано: 720p")
-        height_limit = "[height<=720]"
-    elif choice == "4":
-        print(">> Выбрано: Максимальное качество")
-        # Для макс качества просто берем bestvideo+bestaudio без лимита высоты
+    quality = quality.strip().lower()
+
+    if quality == "360p":
+        return f"{base_video}[height<=360]+{base_audio}/{fallback}"
+    elif quality == "720p":
+        return f"{base_video}[height<=720]+{base_audio}/{fallback}"
+    elif quality == "1080p":
+        return f"{base_video}[height<=1080]+{base_audio}/{fallback}"
+    elif quality == "max":
         return f"{base_video}+{base_audio}/{fallback}"
     else:
-        print(">> Выбрано: 1080p (или по умолчанию)")
-        height_limit = "[height<=1080]"
+        # По умолчанию 1080p
+        return f"{base_video}[height<=1080]+{base_audio}/{fallback}"
 
-    # Собираем строку для yt-dlp с ограничением высоты
-    # Пример: bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]
-    format_str = f"{base_video}{height_limit}+{base_audio}/{fallback}"
-    return format_str
 
-def main():
-    """Главная функция для скачивания видео."""
-    ytdlp_executable = check_ytdlp()
-    
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    links_file_path = os.path.join(script_dir, LINKS_FILE)
+# ============================================================================
+# СКАЧИВАНИЕ
+# ============================================================================
 
-    # Проверка файла со ссылками
-    if not os.path.exists(links_file_path):
-        print(f"Файл {LINKS_FILE} не найден. Создаю его для вас.")
-        with open(links_file_path, 'w') as f:
-            f.write("# Вставьте сюда ссылки на видео с YouTube, каждая на новой строке\n")
-        print(f"Откройте файл {LINKS_FILE}, вставьте ссылки и запустите скрипт снова.")
-        input("Нажмите Enter, чтобы выйти...")
-        return
+def _download_one(
+    link: str,
+    index: int,
+    total: int,
+    format_arg: str,
+    output_dir: str,
+    ytdlp_exe: str,
+    callback: Optional[DownloadCallback],
+    lock: threading.Lock,
+    progress_state: dict,
+) -> Optional[str]:
+    """Скачать одно видео. Возвращает путь к файлу или None при ошибке.
 
-    with open(links_file_path, 'r') as f:
-        links = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    Работает в отдельном потоке ThreadPoolExecutor.
+    """
+    if callback:
+        callback.on_status(f"[{index}/{total}] Скачивание: {link}")
+
+    with lock:
+        progress_state[index] = (0, link)
+
+    cmd = [
+        ytdlp_exe,
+        '-f', format_arg,
+        '--merge-output-format', 'mp4',
+        '--no-playlist',
+        '--ignore-errors',
+        '--no-progress',
+        '-o', os.path.join(output_dir, '%(title)s.%(ext)s'),
+        link,
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        mp4s = [os.path.join(output_dir, f) for f in os.listdir(output_dir)
+                if f.lower().endswith('.mp4') and os.path.isfile(os.path.join(output_dir, f))]
+        if mp4s:
+            latest = max(mp4s, key=os.path.getmtime)
+            with lock:
+                progress_state[index] = (100, os.path.basename(latest))
+            if callback:
+                callback.on_file_done(latest)
+            return latest
+    except subprocess.CalledProcessError as e:
+        with lock:
+            progress_state[index] = (0, link)
+        if callback:
+            callback.on_error(f"Ошибка скачивания: {link}\n{e.stderr or e}")
+    return None
+
+
+def _emit_aggregated_progress(
+    callback: Optional[DownloadCallback],
+    progress_state: dict,
+    total: int,
+    lock: threading.Lock,
+):
+    """Посчитать и излучить средний прогресс по всем активным загрузкам."""
+    with lock:
+        if not progress_state:
+            return
+        total_pct = sum(v[0] for v in progress_state.values())
+        avg_pct = total_pct / len(progress_state)
+        # Показываем имя файла, который ближе всего к среднему прогрессу
+        current_file = ""
+        for idx, (pct, name) in progress_state.items():
+            if abs(pct - avg_pct) < 5 or not current_file:
+                current_file = name or f"файл {idx}"
+    if callback:
+        callback.on_progress(avg_pct, current_file, 1, total)
+
+
+def download_videos(
+    links: list,
+    quality: str,
+    output_dir: str,
+    ytdlp_exe: str,
+    callback: Optional[DownloadCallback] = None,
+    max_workers: int = 3,
+) -> list:
+    """Скачать список YouTube-ссылок в нескольких потоках.
+
+    Args:
+        links: Список URL для скачивания.
+        quality: Желаемое качество (360p, 720p, 1080p, max).
+        output_dir: Папка для сохранения.
+        ytdlp_exe: Путь к yt-dlp.exe.
+        callback: Колбэк для отслеживания прогресса.
+        max_workers: Количество параллельных загрузок (по умолчанию 3).
+
+    Returns:
+        Список путей к скачанным файлам.
+    """
+    os.makedirs(output_dir, exist_ok=True)
 
     if not links:
-        print(f"Файл {LINKS_FILE} пуст. Нечего скачивать.")
-        input("Нажмите Enter, чтобы выйти...")
-        return
+        if callback:
+            callback.on_status("Нет ссылок для скачивания.")
+        return []
 
-    print(f"Найдено ссылок для скачивания: {len(links)}")
-    
-    # Спрашиваем качество ОДИН РАЗ для всего списка
-    format_arg = get_quality_args()
+    format_arg = build_format_string(quality)
+    total = len(links)
 
-    os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-    
-    for i, link in enumerate(links, 1):
-        print(f"\n--- [{i}/{len(links)}] Скачиваю видео: {link} ---")
-        
-        command = [
-            ytdlp_executable,
-            '-f', format_arg,               # Используем выбранное качество
-            '--merge-output-format', 'mp4', # Собираем в MP4
-            '--no-playlist',                # Если ссылка на плейлист, качаем только видео
-            '--ignore-errors',              # Не падать, если видео удалено
-            '-o', os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s'),
-            link
-        ]
-        
-        try:
-            subprocess.run(command, check=True)
-        except subprocess.CalledProcessError:
-            print(f"!!! ОШИБКА при скачивании: {link}")
-            continue
-    
-    print(f"\nГотово! Все видео сохранены в: {DOWNLOAD_FOLDER}")
-    input("Нажмите Enter, чтобы закрыть...")
+    lock = threading.Lock()
+    progress_state: dict = {}  # {index: (percent, filename)}
 
-if __name__ == "__main__":
-    main()
+    downloaded = []
+
+    if callback:
+        callback.on_status(f"Загрузка {total} видео ({max_workers} потоков)…")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _download_one, link, i, total, format_arg,
+                output_dir, ytdlp_exe, callback, lock, progress_state,
+            ): i
+            for i, link in enumerate(links, 1)
+        }
+
+        # По мере завершения — собираем результаты и обновляем прогресс
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                downloaded.append(result)
+            _emit_aggregated_progress(callback, progress_state, total, lock)
+
+    if callback:
+        callback.on_finished(downloaded)
+        callback.on_status(f"Скачано {len(downloaded)} из {total} видео.")
+
+    return downloaded
